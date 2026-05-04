@@ -1,0 +1,24 @@
+Metadata-Version: 2.4
+Name: envguard
+Version: 1.0.0
+Summary: Protect .env files from being sent to LLMs by coding agents
+Author: EnvGuard
+Classifier: Programming Language :: Python :: 3
+Classifier: Operating System :: OS Independent
+Classifier: Environment :: Console
+Classifier: Topic :: Security
+Classifier: Topic :: Utilities
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: click>=8.1.7
+Requires-Dist: watchdog>=4.0.0
+Requires-Dist: psutil>=5.9.8
+Dynamic: author
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+# EnvGuard

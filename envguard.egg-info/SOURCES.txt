@@ -1,0 +1,17 @@
+README.md
+setup.py
+envguard/__init__.py
+envguard/_daemon_runner.py
+envguard/cli.py
+envguard/config.py
+envguard/daemon.py
+envguard/installer.py
+envguard/masker.py
+envguard/watcher.py
+envguard.egg-info/PKG-INFO
+envguard.egg-info/SOURCES.txt
+envguard.egg-info/dependency_links.txt
+envguard.egg-info/entry_points.txt
+envguard.egg-info/requires.txt
+envguard.egg-info/top_level.txt
+tests/test_masker.py
