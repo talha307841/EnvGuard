@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import Optional
 
 from watchdog.events import (
-    FileAccessedEvent,
     FileCreatedEvent,
     FileModifiedEvent,
+    FileOpenedEvent,
     FileSystemEventHandler,
 )
 from watchdog.observers import Observer
@@ -116,10 +116,11 @@ class EnvFileEventHandler(FileSystemEventHandler):
         if not event.is_directory:
             self._handle_env_access("MODIFIED", str(event.src_path))
 
-    def on_accessed(self, event: FileAccessedEvent) -> None:  # type: ignore[override]
-        # FileAccessedEvent is available on Linux (inotify IN_ACCESS) with watchdog ≥ 3
+    def on_opened(self, event: FileOpenedEvent) -> None:  # type: ignore[override]
+        # FileOpenedEvent is available in watchdog 4.x and is the closest cross-platform
+        # signal for read/open attempts on .env files.
         if not event.is_directory:
-            self._handle_env_access("ACCESSED", str(event.src_path))
+            self._handle_env_access("OPENED", str(event.src_path))
 
 
 def build_observer(watched_dirs: list[Path], handler: EnvFileEventHandler) -> Observer:
