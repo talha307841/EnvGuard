@@ -27,7 +27,7 @@ from watchdog.events import (
 from watchdog.observers import Observer
 
 from envguard.config import get_log_path, load_config
-from envguard.masker import mask_env_file
+from envguard.masker import mask_env_content
 
 logger = logging.getLogger(__name__)
 
@@ -216,24 +216,24 @@ class EnvFileEventHandler(FileSystemEventHandler):
         with self._masking_lock:
             self._masking.add(src_path)
         try:
-            tmp_path, results = mask_env_file(
-                Path(src_path),
+            content = Path(src_path).read_text(encoding="utf-8")
+            _, results = mask_env_content(
+                content,
                 safe_keys=self.safe_keys,
                 mask_char=self.mask_char,
                 keep_prefix_chars=self.keep_prefix_chars,
             )
             masked_count = sum(1 for r in results if r.was_masked)
             logger.info(
-                "Masked %d/%d values in %s → %s",
+                "Masked %d/%d values in %s (in-memory preview)",
                 masked_count,
                 len(results),
                 src_path,
-                tmp_path,
             )
             self._write_event_record(
                 event_type=event_type,
                 file_path=src_path,
-                masked_file_path=str(tmp_path) if tmp_path else None,
+                masked_file_path=None,
                 results=results,
             )
         except Exception as exc:

@@ -45,6 +45,8 @@ htmlcov/
 # Runtime logs and local artifacts
 *.log
 .envguard_masked_*.env
+.envguard_masked*.env
+.env-masked-*
 
 # Environment files (keep sample files)
 .env
