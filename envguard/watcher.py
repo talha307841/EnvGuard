@@ -7,6 +7,7 @@ When a .env file is opened/read, logs the access and creates a masked temp copy.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import time
@@ -142,7 +143,19 @@ def run_watcher(
 ) -> None:
     """Start the observer and block until interrupted."""
     observer = build_observer(watched_dirs, handler)
-    observer.start()
+    try:
+        observer.start()
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            raise RuntimeError(
+                "inotify watch limit reached. "
+                "Too many subdirectories are being watched. "
+                "Fix by running:\n"
+                "  echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf\n"
+                "  sudo sysctl -p\n"
+                "Or watch a more specific subdirectory instead of a large tree."
+            ) from exc
+        raise
     if on_started is not None:
         on_started()
     try:

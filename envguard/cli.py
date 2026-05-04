@@ -67,7 +67,18 @@ def start() -> None:
     if success:
         _ok(msg)
     else:
-        _warn(msg)
+        _err(msg)
+        # Print crash log excerpt if available for immediate diagnosis
+        from envguard.config import ENVGUARD_DIR
+        crash_log = ENVGUARD_DIR / "daemon_crash.log"
+        if crash_log.exists():
+            lines = crash_log.read_text(encoding="utf-8").strip().splitlines()
+            # Show the last failure block (up to 20 lines)
+            last_lines = lines[-20:]
+            click.echo()
+            click.secho("  Last startup error:", fg="red", bold=True)
+            for line in last_lines:
+                click.secho(f"     {line}", fg="red")
         sys.exit(1)
 
 
