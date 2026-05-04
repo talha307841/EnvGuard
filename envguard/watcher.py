@@ -12,7 +12,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from watchdog.events import (
     FileCreatedEvent,
@@ -135,10 +135,16 @@ def build_observer(watched_dirs: list[Path], handler: EnvFileEventHandler) -> Ob
     return observer
 
 
-def run_watcher(watched_dirs: list[Path], handler: EnvFileEventHandler) -> None:
+def run_watcher(
+    watched_dirs: list[Path],
+    handler: EnvFileEventHandler,
+    on_started: Optional[Callable[[], None]] = None,
+) -> None:
     """Start the observer and block until interrupted."""
     observer = build_observer(watched_dirs, handler)
     observer.start()
+    if on_started is not None:
+        on_started()
     try:
         while True:
             time.sleep(1)

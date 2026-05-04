@@ -14,6 +14,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from typing import Optional
 
 from envguard.config import PID_PATH, get_log_path, load_config, resolve_watched_dirs
 from envguard.watcher import EnvFileEventHandler, run_watcher
@@ -44,6 +45,79 @@ def _write_startup_crash(exc: Exception) -> None:
     detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     with crash_log.open("a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] Daemon startup failure\n{detail}\n")
+
+
+def _startup_state_path(pid: int) -> Path:
+    return PID_PATH.parent / f"startup.{pid}.state"
+
+
+def _write_startup_state(path: Optional[Path], state: str, detail: str = "") -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = state if not detail else f"{state}:{detail}"
+    path.write_text(payload, encoding="utf-8")
+
+
+def _read_startup_state(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _clear_startup_state(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _wait_for_startup(pid: int, timeout_seconds: float = 3.0) -> tuple[bool, str]:
+    """Wait for daemon startup handshake (ready/error) or early exit."""
+    state_path = _startup_state_path(pid)
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        state = _read_startup_state(state_path)
+        if state.startswith("ready"):
+            _clear_startup_state(state_path)
+            return True, f"EnvGuard started (pid={pid})"
+        if state.startswith("error"):
+            _clear_startup_state(state_path)
+            crash_log = PID_PATH.parent / "daemon_crash.log"
+            if crash_log.exists():
+                return False, f"EnvGuard failed to start; see {crash_log}"
+            return False, "EnvGuard failed to start (watcher initialization error)"
+
+        # Reap exited child promptly on Unix fork path; ignore where unsupported.
+        if os.name == "posix":
+            try:
+                waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+            except OSError:
+                waited_pid = 0
+            if waited_pid == pid:
+                _clear_startup_state(state_path)
+                crash_log = PID_PATH.parent / "daemon_crash.log"
+                if crash_log.exists():
+                    return False, f"EnvGuard failed to start; see {crash_log}"
+                return False, "EnvGuard failed to start (process exited immediately)"
+
+        if not _process_is_running(pid):
+            _clear_startup_state(state_path)
+            crash_log = PID_PATH.parent / "daemon_crash.log"
+            if crash_log.exists():
+                return False, f"EnvGuard failed to start; see {crash_log}"
+            return False, "EnvGuard failed to start (process exited immediately)"
+
+        time.sleep(0.05)
+
+    _clear_startup_state(state_path)
+    if _process_is_running(pid):
+        return True, f"EnvGuard started (pid={pid})"
+    crash_log = PID_PATH.parent / "daemon_crash.log"
+    if crash_log.exists():
+        return False, f"EnvGuard failed to start; see {crash_log}"
+    return False, "EnvGuard failed to start (startup timeout)"
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +179,7 @@ def _process_is_running(pid: int) -> bool:
 # Daemon entry point (runs inside the spawned process)
 # ---------------------------------------------------------------------------
 
-def _daemon_main() -> None:
+def _daemon_main(startup_state_path: Optional[Path] = None) -> None:
     """Main loop executed inside the daemon process."""
     try:
         config = load_config()
@@ -125,10 +199,19 @@ def _daemon_main() -> None:
         )
 
         logger.info("EnvGuard daemon started (pid=%d)", os.getpid())
-        run_watcher(watched_dirs, handler)
+        run_watcher(
+            watched_dirs,
+            handler,
+            on_started=lambda: _write_startup_state(startup_state_path, "ready"),
+        )
         logger.info("EnvGuard daemon stopped")
+    except Exception as exc:  # noqa: BLE001
+        _write_startup_state(startup_state_path, "error", str(exc))
+        _write_startup_crash(exc)
+        raise
     finally:
         _remove_pid()
+        _clear_startup_state(startup_state_path) if startup_state_path else None
 
 
 # ---------------------------------------------------------------------------
@@ -160,21 +243,13 @@ def _start_daemon_unix() -> tuple[bool, str]:
         return _start_daemon_subprocess()
 
     if pid > 0:
-        # Parent: write PID, then briefly verify child is still alive.
+        # Parent: write PID and wait for startup handshake.
         _write_pid(pid)
-        time.sleep(0.2)
-        # If the child has already exited, reap it and report startup failure.
-        try:
-            waited_pid, _ = os.waitpid(pid, os.WNOHANG)
-        except OSError:
-            waited_pid = 0
-        if waited_pid == pid or not _process_is_running(pid):
+        ok, msg = _wait_for_startup(pid)
+        if not ok:
             _remove_pid()
-            crash_log = PID_PATH.parent / "daemon_crash.log"
-            if crash_log.exists():
-                return False, f"EnvGuard failed to start; see {crash_log}"
-            return False, "EnvGuard failed to start (process exited immediately)"
-        return True, f"EnvGuard started (pid={pid})"
+            return False, msg
+        return True, msg
 
     # Child: become a daemon
     try:
@@ -187,7 +262,7 @@ def _start_daemon_unix() -> tuple[bool, str]:
             except OSError:
                 pass
         os.close(devnull)
-        _daemon_main()
+        _daemon_main(startup_state_path=_startup_state_path(os.getpid()))
     except Exception as exc:  # noqa: BLE001
         _write_startup_crash(exc)
     finally:
@@ -210,14 +285,11 @@ def _start_daemon_subprocess() -> tuple[bool, str]:
         start_new_session=True,
     )
     _write_pid(proc.pid)
-    time.sleep(0.2)
-    if proc.poll() is not None or not _process_is_running(proc.pid):
+    ok, msg = _wait_for_startup(proc.pid)
+    if not ok or proc.poll() is not None or not _process_is_running(proc.pid):
         _remove_pid()
-        crash_log = PID_PATH.parent / "daemon_crash.log"
-        if crash_log.exists():
-            return False, f"EnvGuard failed to start; see {crash_log}"
-        return False, "EnvGuard failed to start (process exited immediately)"
-    return True, f"EnvGuard started (pid={proc.pid})"
+        return False, msg
+    return True, msg
 
 
 def _start_daemon_windows() -> tuple[bool, str]:
@@ -236,14 +308,11 @@ def _start_daemon_windows() -> tuple[bool, str]:
         creationflags=CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS,
     )
     _write_pid(proc.pid)
-    time.sleep(0.2)
-    if proc.poll() is not None or not _process_is_running(proc.pid):
+    ok, msg = _wait_for_startup(proc.pid)
+    if not ok or proc.poll() is not None or not _process_is_running(proc.pid):
         _remove_pid()
-        crash_log = PID_PATH.parent / "daemon_crash.log"
-        if crash_log.exists():
-            return False, f"EnvGuard failed to start; see {crash_log}"
-        return False, "EnvGuard failed to start (process exited immediately)"
-    return True, f"EnvGuard started (pid={proc.pid})"
+        return False, msg
+    return True, msg
 
 
 def stop_daemon() -> tuple[bool, str]:
