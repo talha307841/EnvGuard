@@ -105,6 +105,23 @@ envguard log
 envguard log --tail 50
 ```
 
+### Run local dashboard UI
+
+```bash
+envguard dashboard
+```
+
+Then open:
+
+- http://127.0.0.1:8787
+
+The dashboard shows:
+
+- Which coding agent likely opened a protected file
+- Which file was touched and when
+- What masked key/value lines were exposed to the model
+- How many times EnvGuard protected secrets
+
 ## Enable Auto-Start on Ubuntu (systemd user service)
 
 Register startup entry:
@@ -194,6 +211,7 @@ envguard stop
 envguard status
 envguard add <path>
 envguard log
+envguard dashboard
 envguard install
 envguard uninstall
 envguard mask <file> [--dry-run]

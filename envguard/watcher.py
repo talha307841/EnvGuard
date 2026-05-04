@@ -8,8 +8,11 @@ When a .env file is opened/read, logs the access and creates a masked temp copy.
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import os
+import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,17 +62,85 @@ def _get_accessing_process() -> str:
         return f"pid={os.getpid()}"
 
 
+def _detect_coding_agent(file_path: str) -> str:
+    """Best-effort detection of known coding agents touching a target file."""
+    try:
+        import psutil  # type: ignore
+
+        agent_keywords = {
+            "copilot": ["copilot", "github-copilot"],
+            "cursor": ["cursor"],
+            "claude": ["claude"],
+            "code": ["code", "code-insiders", "vscode"],
+            "aider": ["aider"],
+        }
+
+        path_norm = os.path.realpath(file_path)
+        fallback_hits: list[str] = []
+
+        for proc in psutil.process_iter(attrs=["pid", "name", "cmdline"]):
+            try:
+                name = (proc.info.get("name") or "").lower()
+                cmdline_list = proc.info.get("cmdline") or []
+                cmdline = " ".join(cmdline_list).lower()
+                identity = f"{name} {cmdline}"
+
+                matched_label = None
+                for label, words in agent_keywords.items():
+                    if any(word in identity for word in words):
+                        matched_label = label
+                        break
+
+                if not matched_label:
+                    continue
+
+                fallback_hits.append(matched_label)
+
+                # Strong match: process has this file open right now.
+                try:
+                    for opened in proc.open_files():
+                        if os.path.realpath(opened.path) == path_norm:
+                            return matched_label
+                except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                    pass
+            except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                continue
+
+        return fallback_hits[0] if fallback_hits else "unknown"
+    except Exception:
+        return "unknown"
+
+
+# Debounce window: suppress duplicate events for the same file within this many seconds.
+_DEBOUNCE_SECONDS = 1.0
+
+
 class EnvFileEventHandler(FileSystemEventHandler):
     """Watchdog event handler that intercepts .env file access events."""
 
-    def __init__(self, log_path: Path, safe_keys: set[str], mask_char: str, keep_prefix_chars: int):
+    def __init__(
+        self,
+        log_path: Path,
+        events_path: Path,
+        safe_keys: set[str],
+        mask_char: str,
+        keep_prefix_chars: int,
+    ):
         super().__init__()
         self.log_path = log_path
+        self.events_path = events_path
         self.safe_keys = safe_keys
         self.mask_char = mask_char
         self.keep_prefix_chars = keep_prefix_chars
         # Ensure log dir exists
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        events_path.parent.mkdir(parents=True, exist_ok=True)
+        # Re-entrance guard: paths currently being masked by us (to avoid self-triggering).
+        self._masking: set[str] = set()
+        self._masking_lock = threading.Lock()
+        # Debounce: last time we logged each path.
+        self._last_seen: dict[str, float] = {}
+        self._debounce_lock = threading.Lock()
 
     def _log_access(self, event_type: str, file_path: str) -> None:
         ts = datetime.now(timezone.utc).isoformat()
@@ -82,10 +153,68 @@ class EnvFileEventHandler(FileSystemEventHandler):
             logger.warning("Failed to write access log: %s", exc)
         logger.info("ACCESS %s %s [%s]", event_type, file_path, process_info)
 
+    def _write_event_record(
+        self,
+        event_type: str,
+        file_path: str,
+        masked_file_path: Optional[str],
+        results,
+    ) -> None:
+        ts = datetime.now(timezone.utc).isoformat()
+        process_info = _get_accessing_process()
+        agent = _detect_coding_agent(file_path)
+        masked_items = [
+            {
+                "key": r.key,
+                "masked_value": r.masked_value,
+                "was_masked": bool(r.was_masked),
+            }
+            for r in results
+        ]
+        masked_count = sum(1 for r in results if r.was_masked)
+        llm_view = [f"{r.key}={r.masked_value}" for r in results]
+        record = {
+            "timestamp": ts,
+            "event_type": event_type,
+            "file_path": file_path,
+            "process_info": process_info,
+            "agent": agent,
+            "masked_file_path": masked_file_path,
+            "masked_count": masked_count,
+            "total_keys": len(results),
+            "saved_you": masked_count > 0,
+            "masked_items": masked_items,
+            "llm_view": llm_view,
+        }
+        try:
+            with open(self.events_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=True) + "\n")
+        except OSError as exc:
+            logger.warning("Failed to write dashboard event log: %s", exc)
+
+    def _is_debounced(self, src_path: str) -> bool:
+        """Return True if this path was already handled within the debounce window."""
+        now = time.monotonic()
+        with self._debounce_lock:
+            last = self._last_seen.get(src_path, 0.0)
+            if now - last < _DEBOUNCE_SECONDS:
+                return True
+            self._last_seen[src_path] = now
+        return False
+
     def _handle_env_access(self, event_type: str, src_path: str) -> None:
         if not _is_env_file(src_path):
             return
+        # Skip if EnvGuard itself is currently reading this file for masking.
+        with self._masking_lock:
+            if src_path in self._masking:
+                return
+        # Suppress rapid duplicate events for the same file.
+        if self._is_debounced(src_path):
+            return
         self._log_access(event_type, src_path)
+        with self._masking_lock:
+            self._masking.add(src_path)
         try:
             tmp_path, results = mask_env_file(
                 Path(src_path),
@@ -101,8 +230,17 @@ class EnvFileEventHandler(FileSystemEventHandler):
                 src_path,
                 tmp_path,
             )
+            self._write_event_record(
+                event_type=event_type,
+                file_path=src_path,
+                masked_file_path=str(tmp_path) if tmp_path else None,
+                results=results,
+            )
         except Exception as exc:
             logger.error("Failed to mask %s: %s", src_path, exc)
+        finally:
+            with self._masking_lock:
+                self._masking.discard(src_path)
 
     # watchdog fires on_modified for writes; on_created for new files.
     # True "read" interception requires OS-level hooks (inotify IN_ACCESS etc.)
@@ -124,9 +262,37 @@ class EnvFileEventHandler(FileSystemEventHandler):
             self._handle_env_access("OPENED", str(event.src_path))
 
 
+def _make_observer() -> Observer:
+    """Return an Observer with IN_OPEN added to the inotify event mask on Linux.
+
+    watchdog's default inotify mask omits IN_OPEN, so pure reads (e.g. an IDE
+    or coding agent opening a .env file) never fire FileOpenedEvent.  We patch
+    the emitter class to include IN_OPEN before any watch is scheduled.
+    Falls back to the stock Observer on all other platforms.
+    """
+    if sys.platform != "linux":
+        return Observer()
+    try:
+        from watchdog.observers.inotify import InotifyEmitter  # type: ignore[attr-defined]
+        from watchdog.observers.inotify_c import InotifyFlags  # type: ignore[attr-defined]
+
+        class _OpenAwareEmitter(InotifyEmitter):  # type: ignore[misc]
+            EVENT_MASK = InotifyEmitter.EVENT_MASK | InotifyFlags.IN_OPEN
+
+        obs = Observer()
+        obs._emitter_class = _OpenAwareEmitter  # type: ignore[attr-defined]
+        return obs
+    except Exception:
+        logger.warning(
+            "Could not enable IN_OPEN inotify events; "
+            "file-read events may not be detected. Falling back to default observer."
+        )
+        return Observer()
+
+
 def build_observer(watched_dirs: list[Path], handler: EnvFileEventHandler) -> Observer:
     """Create and configure a watchdog Observer for the given directories."""
-    observer = Observer()
+    observer = _make_observer()
     for directory in watched_dirs:
         if directory.is_dir():
             observer.schedule(handler, str(directory), recursive=True)

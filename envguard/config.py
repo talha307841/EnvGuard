@@ -13,8 +13,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "watched_dirs": [],
     "safe_keys": ["NODE_ENV", "PORT", "HOST", "APP_ENV", "DEBUG", "LOG_LEVEL"],
     "log_file": str(ENVGUARD_DIR / "access.log"),
+    "events_file": str(ENVGUARD_DIR / "events.jsonl"),
     "mask_char": "*",
     "keep_prefix_chars": 3,
+    "dashboard_port": 8787,
 }
 
 
@@ -57,3 +59,7 @@ def add_watched_dir(path: str) -> None:
 
 def get_log_path(config: dict[str, Any]) -> Path:
     return Path(os.path.expanduser(config.get("log_file", str(ENVGUARD_DIR / "access.log"))))
+
+
+def get_events_path(config: dict[str, Any]) -> Path:
+    return Path(os.path.expanduser(config.get("events_file", str(ENVGUARD_DIR / "events.jsonl"))))

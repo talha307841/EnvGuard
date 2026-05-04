@@ -16,7 +16,7 @@ import traceback
 from pathlib import Path
 from typing import Optional
 
-from envguard.config import PID_PATH, get_log_path, load_config, resolve_watched_dirs
+from envguard.config import PID_PATH, get_events_path, get_log_path, load_config, resolve_watched_dirs
 from envguard.watcher import EnvFileEventHandler, run_watcher
 
 logger = logging.getLogger(__name__)
@@ -184,6 +184,7 @@ def _daemon_main(startup_state_path: Optional[Path] = None) -> None:
     try:
         config = load_config()
         log_path = get_log_path(config)
+        events_path = get_events_path(config)
         _setup_logging(log_path)
 
         watched_dirs = resolve_watched_dirs(config)
@@ -193,6 +194,7 @@ def _daemon_main(startup_state_path: Optional[Path] = None) -> None:
 
         handler = EnvFileEventHandler(
             log_path=log_path,
+            events_path=events_path,
             safe_keys=safe_keys,
             mask_char=mask_char,
             keep_prefix_chars=keep_prefix_chars,

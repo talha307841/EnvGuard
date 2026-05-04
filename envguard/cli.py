@@ -7,6 +7,7 @@ Commands:
   envguard status         — show running status + last 10 log lines
   envguard add <path>     — add a directory to watch
   envguard log            — show full access log
+    envguard dashboard      — open local UI dashboard for events and counters
   envguard install        — register EnvGuard for system startup
   envguard uninstall      — remove EnvGuard from system startup
   envguard mask <file>    — mask a .env file (prints result or writes temp file)
@@ -23,6 +24,7 @@ import click
 from envguard import __version__
 from envguard.config import add_watched_dir, load_config, resolve_watched_dirs
 from envguard.daemon import get_log_lines, get_status, start_daemon, stop_daemon
+from envguard.dashboard import serve_dashboard
 from envguard.installer import install_startup, uninstall_startup
 
 
@@ -170,6 +172,20 @@ def show_log(tail: int) -> None:
         return
     for line in lines:
         _log_line_colored(line)
+
+
+# ---------------------------------------------------------------------------
+# dashboard
+# ---------------------------------------------------------------------------
+
+@cli.command("dashboard")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Dashboard bind host.")
+@click.option("--port", default=8787, show_default=True, type=int, help="Dashboard bind port.")
+def dashboard_cmd(host: str, port: int) -> None:
+    """Run a minimal local dashboard showing .env access attempts and masked values."""
+    click.secho(f"  Dashboard running at http://{host}:{port}", fg="cyan")
+    click.secho("  Press Ctrl+C to stop.", fg="white")
+    serve_dashboard(host=host, port=port)
 
 
 # ---------------------------------------------------------------------------
