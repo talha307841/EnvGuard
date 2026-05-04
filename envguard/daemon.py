@@ -83,10 +83,22 @@ def _process_is_running(pid: int) -> bool:
                 return True
             return False
         else:
-            os.kill(pid, 0)
-            return True
+            # Prefer psutil so zombie processes are not treated as healthy.
+            import psutil  # type: ignore
+
+            proc = psutil.Process(pid)
+            if proc.status() == psutil.STATUS_ZOMBIE:
+                return False
+            return proc.is_running()
     except (ProcessLookupError, PermissionError, OSError):
         return False
+    except Exception:
+        # Fallback if psutil fails unexpectedly on a platform edge-case.
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +163,12 @@ def _start_daemon_unix() -> tuple[bool, str]:
         # Parent: write PID, then briefly verify child is still alive.
         _write_pid(pid)
         time.sleep(0.2)
-        if not _process_is_running(pid):
+        # If the child has already exited, reap it and report startup failure.
+        try:
+            waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+        except OSError:
+            waited_pid = 0
+        if waited_pid == pid or not _process_is_running(pid):
             _remove_pid()
             crash_log = PID_PATH.parent / "daemon_crash.log"
             if crash_log.exists():
@@ -194,7 +211,7 @@ def _start_daemon_subprocess() -> tuple[bool, str]:
     )
     _write_pid(proc.pid)
     time.sleep(0.2)
-    if not _process_is_running(proc.pid):
+    if proc.poll() is not None or not _process_is_running(proc.pid):
         _remove_pid()
         crash_log = PID_PATH.parent / "daemon_crash.log"
         if crash_log.exists():
@@ -220,7 +237,7 @@ def _start_daemon_windows() -> tuple[bool, str]:
     )
     _write_pid(proc.pid)
     time.sleep(0.2)
-    if not _process_is_running(proc.pid):
+    if proc.poll() is not None or not _process_is_running(proc.pid):
         _remove_pid()
         crash_log = PID_PATH.parent / "daemon_crash.log"
         if crash_log.exists():
