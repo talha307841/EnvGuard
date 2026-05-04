@@ -11,6 +11,8 @@ import logging
 import os
 import signal
 import sys
+import time
+import traceback
 from pathlib import Path
 
 from envguard.config import PID_PATH, get_log_path, load_config, resolve_watched_dirs
@@ -32,6 +34,16 @@ def _setup_logging(log_path: Path) -> None:
             logging.FileHandler(str(log_path.parent / "envguard_service.log"), encoding="utf-8"),
         ],
     )
+
+
+def _write_startup_crash(exc: Exception) -> None:
+    """Persist daemon startup crashes so failures are diagnosable."""
+    PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    crash_log = PID_PATH.parent / "daemon_crash.log"
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    with crash_log.open("a", encoding="utf-8") as f:
+        f.write(f"[{timestamp}] Daemon startup failure\n{detail}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -83,26 +95,28 @@ def _process_is_running(pid: int) -> bool:
 
 def _daemon_main() -> None:
     """Main loop executed inside the daemon process."""
-    config = load_config()
-    log_path = get_log_path(config)
-    _setup_logging(log_path)
+    try:
+        config = load_config()
+        log_path = get_log_path(config)
+        _setup_logging(log_path)
 
-    watched_dirs = resolve_watched_dirs(config)
-    safe_keys = set(config.get("safe_keys", []))
-    mask_char = config.get("mask_char", "*")
-    keep_prefix_chars = int(config.get("keep_prefix_chars", 3))
+        watched_dirs = resolve_watched_dirs(config)
+        safe_keys = set(config.get("safe_keys", []))
+        mask_char = config.get("mask_char", "*")
+        keep_prefix_chars = int(config.get("keep_prefix_chars", 3))
 
-    handler = EnvFileEventHandler(
-        log_path=log_path,
-        safe_keys=safe_keys,
-        mask_char=mask_char,
-        keep_prefix_chars=keep_prefix_chars,
-    )
+        handler = EnvFileEventHandler(
+            log_path=log_path,
+            safe_keys=safe_keys,
+            mask_char=mask_char,
+            keep_prefix_chars=keep_prefix_chars,
+        )
 
-    logger.info("EnvGuard daemon started (pid=%d)", os.getpid())
-    run_watcher(watched_dirs, handler)
-    logger.info("EnvGuard daemon stopped")
-    _remove_pid()
+        logger.info("EnvGuard daemon started (pid=%d)", os.getpid())
+        run_watcher(watched_dirs, handler)
+        logger.info("EnvGuard daemon stopped")
+    finally:
+        _remove_pid()
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +148,15 @@ def _start_daemon_unix() -> tuple[bool, str]:
         return _start_daemon_subprocess()
 
     if pid > 0:
-        # Parent: write PID file and return
+        # Parent: write PID, then briefly verify child is still alive.
         _write_pid(pid)
+        time.sleep(0.2)
+        if not _process_is_running(pid):
+            _remove_pid()
+            crash_log = PID_PATH.parent / "daemon_crash.log"
+            if crash_log.exists():
+                return False, f"EnvGuard failed to start; see {crash_log}"
+            return False, "EnvGuard failed to start (process exited immediately)"
         return True, f"EnvGuard started (pid={pid})"
 
     # Child: become a daemon
@@ -151,8 +172,7 @@ def _start_daemon_unix() -> tuple[bool, str]:
         os.close(devnull)
         _daemon_main()
     except Exception as exc:  # noqa: BLE001
-        # Log to stderr before redirect takes effect
-        print(f"EnvGuard daemon error: {exc}", file=sys.stderr)
+        _write_startup_crash(exc)
     finally:
         os._exit(0)
 
@@ -173,6 +193,13 @@ def _start_daemon_subprocess() -> tuple[bool, str]:
         start_new_session=True,
     )
     _write_pid(proc.pid)
+    time.sleep(0.2)
+    if not _process_is_running(proc.pid):
+        _remove_pid()
+        crash_log = PID_PATH.parent / "daemon_crash.log"
+        if crash_log.exists():
+            return False, f"EnvGuard failed to start; see {crash_log}"
+        return False, "EnvGuard failed to start (process exited immediately)"
     return True, f"EnvGuard started (pid={proc.pid})"
 
 
@@ -192,6 +219,13 @@ def _start_daemon_windows() -> tuple[bool, str]:
         creationflags=CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS,
     )
     _write_pid(proc.pid)
+    time.sleep(0.2)
+    if not _process_is_running(proc.pid):
+        _remove_pid()
+        crash_log = PID_PATH.parent / "daemon_crash.log"
+        if crash_log.exists():
+            return False, f"EnvGuard failed to start; see {crash_log}"
+        return False, "EnvGuard failed to start (process exited immediately)"
     return True, f"EnvGuard started (pid={proc.pid})"
 
 
@@ -226,6 +260,8 @@ def get_status() -> dict:
     """Return a status dict with running state, pid, and watched dirs."""
     pid = _read_pid()
     running = pid is not None and _process_is_running(pid)
+    if pid is not None and not running:
+        _remove_pid()
     config = load_config()
     return {
         "running": running,
